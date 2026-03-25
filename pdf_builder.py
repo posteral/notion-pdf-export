@@ -131,7 +131,7 @@ def build_pdf(pages: list[dict], output_path: str) -> None:
         rightMargin=20 * mm,
         topMargin=20 * mm,
         bottomMargin=20 * mm,
-        title=pages[0]["title"] if pages else "Notion Export",
+        title=pages[0]["title"] if pages else "Web Export",
     )
 
     story = []

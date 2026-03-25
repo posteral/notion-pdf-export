@@ -1,19 +1,22 @@
 """
-notion-pdf-export: crawl a public Notion site and produce a single PDF.
+web-to-pdf: crawl any public website and produce a single PDF.
+
+Uses Playwright (headless Chromium) to handle JavaScript-rendered pages.
+Has enhanced support for Notion-hosted sites.
 
 Usage:
     python scraper.py <root_url> [--output FILE] [--max-pages N] [--delay SECS]
 """
+from __future__ import annotations
 
 import argparse
-import html
 import logging
 import time
 from collections import deque
 from urllib.parse import urljoin, urlparse, urlunparse
 
-import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright, Page, TimeoutError as PWTimeout
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 log = logging.getLogger(__name__)
@@ -22,24 +25,36 @@ log = logging.getLogger(__name__)
 # URL helpers
 # ---------------------------------------------------------------------------
 
-# Link paths that are never worth following
 SKIP_PATH_FRAGMENTS = (
     "/login", "/signup", "/sign-up", "/sign-in",
     "/register", "/logout", "/pricing", "/blog",
-    "/cookie", "/report", "/abuse",
+    "/cookie", "/report", "/abuse", "/template",
 )
 
-SKIP_QUERY_PARAMS = ("redirectTo", "utm_")
+# Notion-specific junk UI strings
+_NOTION_JUNK = {
+    "get notion free", "try notion free", "duplicate page",
+    "powered by notion", "notion – the all-in-one workspace", "notion",
+    "try it free",
+}
 
-BROWSER_UA = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/123.0.0.0 Safari/537.36"
-)
+# Generic junk strings present on most sites
+_GENERIC_JUNK = {
+    "skip to content", "sign up", "sign in", "log in", "login",
+    "get started", "cookie settings", "report page",
+    "accept cookies", "accept all", "privacy policy", "terms of service",
+    "subscribe", "newsletter",
+}
+
+JUNK_STRINGS = _NOTION_JUNK | _GENERIC_JUNK
+
+
+def _is_notion_url(url: str) -> bool:
+    host = urlparse(url).netloc.lower()
+    return "notion.site" in host or "notion.so" in host
 
 
 def normalize_url(url: str) -> str:
-    """Remove fragment, normalize trailing slash, lowercase scheme+host."""
     p = urlparse(url)
     path = p.path.rstrip("/") or "/"
     return urlunparse((p.scheme.lower(), p.netloc.lower(), path, p.params, p.query, ""))
@@ -50,7 +65,6 @@ def same_host(url: str, root: str) -> bool:
 
 
 def should_follow(url: str, root: str) -> bool:
-    """Return True if this link is worth crawling."""
     p = urlparse(url)
     if p.scheme not in ("http", "https"):
         return False
@@ -59,47 +73,56 @@ def should_follow(url: str, root: str) -> bool:
     path_lower = p.path.lower()
     if any(skip in path_lower for skip in SKIP_PATH_FRAGMENTS):
         return False
-    if any(param in p.query for param in SKIP_QUERY_PARAMS):
-        return False
     return True
 
 
 # ---------------------------------------------------------------------------
-# HTTP session
+# Page fetching with Playwright
 # ---------------------------------------------------------------------------
 
-def make_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": BROWSER_UA,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-    })
-    return s
+_NOTION_SELECTORS = ".notion-page-content, .notion-body, main, [class*='notionFrame']"
+_GENERIC_SELECTORS = "main, article, [role='main'], #content, #main, .content, .post, .article"
 
 
-def fetch(session: requests.Session, url: str) -> BeautifulSoup | None:
+def fetch_rendered(page: Page, url: str) -> str | None:
+    """Navigate to url, wait for content to load, return full HTML.
+
+    Tries Notion-specific selectors first, then falls back to generic ones.
+    """
     try:
-        resp = session.get(url, timeout=15, allow_redirects=True)
-        resp.raise_for_status()
-        return BeautifulSoup(resp.text, "lxml")
-    except requests.RequestException as e:
-        log.warning("Failed to fetch %s: %s", url, e)
+        log.info("  → Navigating (domcontentloaded)...")
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        log.info("  → DOM loaded, waiting for content selector...")
+        found = False
+        for selectors, label in (
+            (_NOTION_SELECTORS, "Notion"),
+            (_GENERIC_SELECTORS, "generic"),
+        ):
+            try:
+                page.wait_for_selector(selectors, timeout=10000)
+                log.info("  → %s content selector found", label)
+                found = True
+                break
+            except PWTimeout:
+                pass
+        if not found:
+            log.warning("  → No content selector matched, proceeding with whatever loaded")
+        log.info("  → Waiting 2s for lazy blocks...")
+        page.wait_for_timeout(2000)
+        html = page.content()
+        log.info("  → Got %d bytes of HTML", len(html))
+        return html
+    except PWTimeout:
+        log.warning("  → Timeout fetching %s", url)
+        return None
+    except Exception as e:
+        log.warning("  → Error fetching %s: %s", url, e)
         return None
 
 
 # ---------------------------------------------------------------------------
-# Notion content extraction
+# Content extraction
 # ---------------------------------------------------------------------------
-
-# UI noise to strip (case-insensitive exact or prefix match)
-JUNK_STRINGS = {
-    "skip to content", "get notion free", "sign up", "sign in",
-    "log in", "login", "try notion free", "duplicate page",
-    "cookie settings", "report page", "powered by notion",
-    "notion – the all-in-one workspace", "notion",
-}
-
 
 def is_junk(text: str) -> bool:
     t = text.strip().lower()
@@ -107,45 +130,69 @@ def is_junk(text: str) -> bool:
 
 
 def extract_title(soup: BeautifulSoup, url: str) -> str:
-    """Extract the page title with several fallback strategies."""
-    # 1. Notion page title block
-    for sel in (".notion-title", ".notion-page-block .notranslate",
-                "[class*='notionTitle']", "h1.notion-header__title"):
+    # Notion-specific selectors (highest priority on Notion pages)
+    for sel in (
+        ".notion-page-block .notranslate",
+        ".notion-title",
+        "h1.notion-header__title",
+        "[class*='notionTitle']",
+    ):
         el = soup.select_one(sel)
         if el and el.get_text(strip=True):
             return el.get_text(strip=True)
-    # 2. <title> tag, strip common suffixes
+
+    # Generic: first visible h1
+    for h1 in soup.find_all("h1"):
+        t = h1.get_text(strip=True)
+        if t and not is_junk(t):
+            return t
+
+    # <title> tag with common suffixes stripped
     title_tag = soup.find("title")
     if title_tag:
         t = title_tag.get_text(strip=True)
-        for suffix in (" - Notion", " | Notion", " – Notion"):
+        for suffix in (
+            " - Notion", " | Notion", " – Notion",
+            " | Home", " - Home",
+        ):
             t = t.removesuffix(suffix)
-        if t:
+        # Strip everything after the last common separator if the remainder is short
+        for sep in (" | ", " – ", " - "):
+            if sep in t:
+                candidate = t.split(sep)[0].strip()
+                if candidate and not is_junk(candidate):
+                    t = candidate
+                    break
+        if t and not is_junk(t):
             return t
-    # 3. Derive from URL slug
+
+    # Fallback: humanise the URL slug
     slug = urlparse(url).path.rstrip("/").rsplit("/", 1)[-1]
-    return slug.replace("-", " ").title() or url
+    # Strip Notion page ID (last 32 hex chars) if present
+    parts = slug.split("-")
+    if parts and len(parts[-1]) == 32:
+        parts = parts[:-1]
+    return " ".join(parts).title() or url
 
 
 def extract_content(soup: BeautifulSoup) -> list[tuple[str, str]]:
-    """
-    Return a list of (kind, text) tuples where kind is one of:
-    h1, h2, h3, body, bullet, quote, divider.
-
-    Tries Notion-specific containers first, falls back to generic HTML.
-    """
     items: list[tuple[str, str]] = []
 
-    # Try Notion's content container
+    # Notion-specific containers take priority; fall back to generic semantic HTML
     container = (
         soup.select_one(".notion-page-content")
         or soup.select_one(".notion-body")
         or soup.select_one("article")
+        or soup.select_one("[role='main']")
         or soup.select_one("main")
+        or soup.select_one("#content")
+        or soup.select_one("#main")
         or soup.find("body")
     )
     if not container:
         return items
+
+    seen_texts: set[str] = set()
 
     for el in container.find_all(True):
         tag = el.name
@@ -154,41 +201,45 @@ def extract_content(soup: BeautifulSoup) -> list[tuple[str, str]]:
 
         if is_junk(text):
             continue
+        if text in seen_texts:
+            continue
 
-        # Headings
-        if tag == "h1" or "notion-header-block" in classes or "notion-heading1" in classes:
-            items.append(("h1", text))
-        elif tag == "h2" or "notion-sub_header-block" in classes or "notion-heading2" in classes:
-            items.append(("h2", text))
-        elif tag == "h3" or "notion-sub_sub_header-block" in classes or "notion-heading3" in classes:
-            items.append(("h3", text))
-        # Bullets
-        elif tag in ("li",) or "notion-bulleted_list-block" in classes or "notion-to_do-block" in classes:
-            items.append(("bullet", text))
-        # Blockquote / callout
-        elif tag == "blockquote" or "notion-quote-block" in classes or "notion-callout-block" in classes:
-            items.append(("quote", text))
-        # Divider
-        elif tag == "hr" or "notion-divider-block" in classes:
-            items.append(("divider", ""))
-        # Paragraphs and generic text blocks
+        kind = None
+
+        # Headings — Notion classes first, then standard HTML tags
+        if any(c in classes for c in ("notion-header-block", "notion-heading1")) or tag == "h1":
+            kind = "h1"
+        elif any(c in classes for c in ("notion-sub_header-block", "notion-heading2")) or tag == "h2":
+            kind = "h2"
+        elif any(c in classes for c in ("notion-sub_sub_header-block", "notion-heading3")) or tag in ("h3", "h4", "h5", "h6"):
+            kind = "h3"
+
+        # Lists — Notion classes first, then standard HTML
+        elif any(c in classes for c in ("notion-bulleted_list-block", "notion-to_do-block")) or tag == "li":
+            kind = "bullet"
+
+        # Quotes / callouts
+        elif any(c in classes for c in ("notion-quote-block", "notion-callout-block")) or tag == "blockquote":
+            kind = "quote"
+
+        # Dividers
+        elif "notion-divider-block" in classes or tag == "hr":
+            kind = "divider"
+
+        # Body text — p/span/div that aren't just wrappers
         elif tag in ("p", "span", "div") and text:
-            # Avoid duplicating text already captured by a child element
             child_texts = {c.get_text(" ", strip=True) for c in el.find_all(True)}
             if text not in child_texts:
-                items.append(("body", text))
+                kind = "body"
 
-    # Deduplicate consecutive identical entries
-    deduped: list[tuple[str, str]] = []
-    for item in items:
-        if not deduped or deduped[-1] != item:
-            deduped.append(item)
+        if kind:
+            items.append((kind, text))
+            seen_texts.add(text)
 
-    return deduped
+    return items
 
 
 def extract_links(soup: BeautifulSoup, page_url: str) -> list[str]:
-    """Return normalized absolute URLs found on this page."""
     links = []
     for a in soup.find_all("a", href=True):
         href = a["href"].strip()
@@ -204,35 +255,56 @@ def extract_links(soup: BeautifulSoup, page_url: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def crawl(root_url: str, max_pages: int, delay: float) -> list[dict]:
-    """BFS crawl starting from root_url. Returns list of page records."""
     root_url = normalize_url(root_url)
-    session = make_session()
     visited: set[str] = set()
     queue: deque[str] = deque([root_url])
     pages: list[dict] = []
 
-    while queue and len(pages) < max_pages:
-        url = queue.popleft()
-        if url in visited:
-            continue
-        visited.add(url)
+    with sync_playwright() as pw:
+        log.info("Launching headless Chromium...")
+        browser = pw.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 900},
+        )
+        page = context.new_page()
 
-        log.info("[%d/%d] Fetching %s", len(pages) + 1, max_pages, url)
-        soup = fetch(session, url)
-        if soup is None:
-            continue
+        while queue and len(pages) < max_pages:
+            url = queue.popleft()
+            if url in visited:
+                continue
+            visited.add(url)
 
-        title = extract_title(soup, url)
-        content = extract_content(soup)
-        pages.append({"url": url, "title": title, "content": content})
+            log.info("[%d/%d] Fetching %s", len(pages) + 1, max_pages, url)
+            html_content = fetch_rendered(page, url)
+            if not html_content:
+                continue
 
-        # Enqueue new links
-        for link in extract_links(soup, url):
-            if link not in visited and should_follow(link, root_url):
+            soup = BeautifulSoup(html_content, "lxml")
+            title = extract_title(soup, url)
+            content = extract_content(soup)
+
+            log.info("  → \"%s\" (%d content blocks)", title, len(content))
+            pages.append({"url": url, "title": title, "content": content})
+
+            new_links = [
+                link for link in extract_links(soup, url)
+                if link not in visited and should_follow(link, root_url)
+            ]
+            log.info("  → Found %d new links to follow", len(new_links))
+            for link in new_links:
+                log.info("    + %s", link)
                 queue.append(link)
 
-        if queue:
-            time.sleep(delay)
+            if queue:
+                log.info("  → Sleeping %.1fs before next page...", delay)
+                time.sleep(delay)
+
+        browser.close()
 
     log.info("Crawl complete. %d pages collected.", len(pages))
     return pages
@@ -243,11 +315,11 @@ def crawl(root_url: str, max_pages: int, delay: float) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Export a public Notion site to PDF.")
-    p.add_argument("url", help="Root URL of the public Notion site")
-    p.add_argument("--output", default="notion_export.pdf", help="Output PDF filename")
+    p = argparse.ArgumentParser(description="Crawl any public website and export to PDF.")
+    p.add_argument("url", help="Root URL to crawl")
+    p.add_argument("--output", default="export.pdf", help="Output PDF filename")
     p.add_argument("--max-pages", type=int, default=100, help="Maximum pages to crawl")
-    p.add_argument("--delay", type=float, default=1.0, help="Delay between requests (seconds)")
+    p.add_argument("--delay", type=float, default=1.5, help="Delay between requests (seconds)")
     return p.parse_args()
 
 
