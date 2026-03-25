@@ -1,6 +1,6 @@
 # notion-pdf-export
 
-Crawls a public Notion site (notion.site or notion.so public workspace) and produces a single consolidated PDF containing the readable content of every reachable page.
+Crawls any public website and produces a single consolidated PDF containing the readable content of every reachable page. Has enhanced support for Notion-hosted sites (notion.site / notion.so).
 
 ## Setup
 
@@ -15,21 +15,25 @@ pip install -r requirements.txt
 
 ```bash
 python scraper.py "https://example.notion.site/Candidate-Book-abc123" --output candidate_book.pdf
+python scraper.py "https://docs.example.com" --output docs.pdf
 ```
 
 ### Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--output` | `notion_export.pdf` | Output PDF filename |
+| `--output` | `export.pdf` | Output PDF filename |
 | `--max-pages` | `100` | Maximum number of pages to crawl |
-| `--delay` | `1.0` | Seconds to wait between requests |
+| `--delay` | `1.5` | Seconds to wait between requests |
 
 ### Examples
 
 ```bash
-# Basic export
+# Notion site
 python scraper.py "https://mycompany.notion.site/Handbook-abc123"
+
+# Any public site
+python scraper.py "https://docs.example.com" --output docs.pdf
 
 # Custom output name and page limit
 python scraper.py "https://mycompany.notion.site/Handbook-abc123" \
@@ -50,14 +54,13 @@ python scraper.py "https://mycompany.notion.site/Handbook-abc123" --delay 0.5
 ## Limitations
 
 - **Public pages only.** Private or login-gated content will not be accessible.
-- **JavaScript-rendered content may be missing.** Notion sometimes lazy-loads content via JS. This scraper uses plain HTTP requests and will miss content that requires a real browser to render. Most classic Notion public pages work fine; newer Next.js-rendered pages may return less content.
-- **Text-oriented output.** The PDF is clean and readable but does not reproduce Notion's visual layout, images, tables, or embedded media.
-- **Best-effort extraction.** Notion's HTML structure varies across page types; some pages may produce sparse output.
+- **Text-oriented output.** The PDF is clean and readable but does not reproduce the original visual layout, images, tables, or embedded media.
+- **Best-effort extraction.** Sites with non-standard HTML structure or heavy client-side rendering may produce sparse output. Notion pages are the best-supported case.
 
 ## Tweaking the code
 
 | Goal | Where to change |
 |------|----------------|
 | Stricter link filtering | `should_follow()` in `scraper.py` — add more entries to `SKIP_PATH_FRAGMENTS` or add domain-specific rules |
-| Better Notion UI junk removal | `JUNK_STRINGS` set and `is_junk()` in `scraper.py`, and the `extract_content()` function — add more class names or text patterns to skip |
+| Add site-specific junk removal | `_NOTION_JUNK` / `_GENERIC_JUNK` sets and `is_junk()` in `scraper.py` — add text patterns to skip; `extract_content()` for structural changes |
 | Different PDF layout | `pdf_builder.py` — adjust `ParagraphStyle` definitions at the top, or change the flowable pipeline in `_page_flowables()` |
