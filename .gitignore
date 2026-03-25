@@ -1,0 +1,15 @@
+# IDE
+.idea/
+
+# Virtual environment
+.venv/
+
+# Generated PDFs
+*.pdf
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
